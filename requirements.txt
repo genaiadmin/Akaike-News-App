@@ -1,0 +1,9 @@
+beautifulsoup4
+requests
+transformers
+nltk
+gtts
+streamlit
+fastapi
+uvicorn
+pydantic
