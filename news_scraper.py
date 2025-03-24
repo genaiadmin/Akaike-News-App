@@ -1,80 +1,105 @@
+import feedparser
+import logging
 import requests
 from bs4 import BeautifulSoup
-from transformers import pipeline
-from sentiment_analysis import analyze_sentiment  # Import Sentiment Analysis
-from comparative_analysis import generate_sentiment_report  # Import Comparative Analysis
-from hindi_tts import generate_hindi_tts  # Import Hindi Text-to-Speech
-from IPython.display import Audio, display  # ✅ FIXED: Import `display`
+from deep_translator import GoogleTranslator
+from gtts import gTTS
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+import os
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Load AI-powered summarization model
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+def setup_logging():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def get_news(company):
-    """Fetches the latest 10 news articles for a given company and analyzes sentiment."""
-    url = f"https://www.bing.com/news/search?q={company}&form=QBNH"
-    headers = {"User-Agent": "Mozilla/5.0"}
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_news_rss(company_name):
+    company_name = company_name.replace(" ", "+")  # Replace spaces with '+' for URL encoding
+    url = f'https://news.google.com/rss/search?q={company_name}&hl=en-IN&gl=IN&ceid=IN:en'
+    feed = feedparser.parse(url)
     
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return {"error": f"Unable to fetch news (Status Code: {response.status_code})"}
-    
-    soup = BeautifulSoup(response.text, "html.parser")
-    articles = soup.find_all("a", class_="title")[:10]  # Adjust selector if needed
+    if not feed.entries:
+        logging.warning("कोई समाचार नहीं मिला।")
+        return []
     
     news_list = []
-    for article in articles:
-        title = article.text.strip()
-        link = article["href"]
-        summary = summarize_text(title)  # Summarize the news headline
-        sentiment = analyze_sentiment(summary)  # Analyze sentiment
-
-        news_list.append({
-            "title": title,
-            "link": link,
-            "summary": summary,
-            "sentiment": sentiment  # Store sentiment label
-        })
+    for entry in feed.entries[:10]:
+        title = entry.title
+        link = entry.link
+        content = entry.summary if 'summary' in entry else "कोई सामग्री उपलब्ध नहीं।"
+        news_list.append({"title": title, "content": content, "link": link})
     
     return news_list
 
-def summarize_text(text):
-    """Summarizes text using a Transformer model with optimized length settings."""
-    words = len(text.split())  # Count words
-    max_length = max(15, min(30, words - 5))  # Optimize summarization length
-    
-    if words < 10:  # Skip summarization for very short text
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_news_bs4(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        paragraphs = soup.find_all('p')
+        content = ' '.join([p.get_text() for p in paragraphs])
+        return content if content else "कोई सामग्री उपलब्ध नहीं।"
+    except requests.RequestException as e:
+        logging.error(f"वेब स्क्रैपिंग विफल: {e}")
+        return ""
+
+def translate_to_hindi(text):
+    if not text.strip():
         return text  
-    
-    summary = summarizer(text, max_length=max_length, min_length=10, do_sample=False)
-    return summary[0]['summary_text']
+    try:
+        translated_text = GoogleTranslator(source='auto', target='hi').translate(text)
+        return translated_text if translated_text else text
+    except Exception as e:
+        logging.error(f"अनुवाद में त्रुटि: {e}")
+        return text
 
-if __name__ == "__main__":
-    company_name = input("Enter the company name: ")
-    news_results = get_news(company_name)
-
-    print("\nLatest News Articles with Sentiment Analysis:")
-    if news_results and "error" not in news_results:
-        for idx, news in enumerate(news_results, 1):
-            print(f"{idx}. {news['title']}")
-            print(f"   Summary: {news['summary']}")
-            print(f"   Sentiment: {news['sentiment']}")  
-            print(f"   Link: {news['link']}\n")
-
-        # ✅ Generate and Display Comparative Sentiment Analysis Report
-        sentiment_report = generate_sentiment_report(news_results)
-        print("\n📊 Sentiment Analysis Report:")
-        print(f"   Positive: {sentiment_report['Positive']}")
-        print(f"   Negative: {sentiment_report['Negative']}")
-        print(f"   Neutral: {sentiment_report['Neutral']}")
-        print(f"   Total Articles: {sentiment_report['Total Articles']}")
-        print(f"   Overall Sentiment: {sentiment_report['Overall Sentiment']}")
-
-        # ✅ Generate and Play Hindi Text-to-Speech
-        generate_hindi_tts(sentiment_report)
-        print("\n🔊 Playing Sentiment Report in Hindi...")
-        
-        # ✅ FIXED: Play the Hindi speech file correctly
-        display(Audio("sentiment_report.mp3"))
-
+def analyze_sentiment(text):
+    analyzer = SentimentIntensityAnalyzer()
+    sentiment_score = analyzer.polarity_scores(text)
+    if sentiment_score['compound'] > 0.05:
+        return "Positive"
+    elif sentiment_score['compound'] < -0.05:
+        return "Negative"
     else:
-        print("No news articles found or an error occurred.")
+        return "Neutral"
+
+def generate_tts(text):
+    try:
+        filename = f"tts_{int(time.time())}.mp3"
+        tts = gTTS(text=text, lang='hi')
+        tts.save(filename)
+        return filename
+    except Exception as e:
+        logging.error(f"TTS त्रुटि: {e}")
+        return None
+
+def get_translated_news(company_name):
+    setup_logging()
+    try:
+        news_articles = fetch_news_rss(company_name)
+    except Exception as e:
+        logging.error(f"समाचार प्राप्त करने में असफल: {e}")
+        return []
+    
+    if not news_articles:
+        return []
+    
+    translated_news = []
+    for article in news_articles:
+        full_content = fetch_news_bs4(article["link"]) if article["content"] == "कोई सामग्री उपलब्ध नहीं।" else article["content"]
+        sentiment = analyze_sentiment(full_content)
+        translated_title = translate_to_hindi(article["title"])
+        translated_content = translate_to_hindi(full_content)
+        audio_file = generate_tts(translated_content)
+        
+        translated_news.append({
+            "title": translated_title,
+            "content": translated_content,
+            "link": article["link"],
+            "sentiment": sentiment,
+            "audio": audio_file
+        })
+    
+    return translated_news
